@@ -1,6 +1,6 @@
 # Private Mode Design
 
-**Status:** Draft
+**Status:** Approved design; implementation is a follow-up
 **Date:** 2026-05-10
 **Scope:** macOS app at `apps/macos/Clearance`
 
@@ -12,27 +12,27 @@ The user wants the choice to suspend history recording without losing the recent
 
 ## Goals
 
-- An app-wide preference, persisted in `UserDefaults`, that suspends writes to the recents history.
+- An app-wide preference, persisted in `UserDefaults`, that suspends automatic recording of opened files in the recents history.
 - The sidebar continues to function as a navigation surface during a private session: files opened while private mode is on appear in the list for the current session only.
-- Quitting and relaunching with private mode on restores the sidebar to exactly the persistent history that existed before the session, untouched.
+- Quitting and relaunching with private mode on restores the saved history, including any explicit removals made during the session.
 - Visible signal in the UI when private mode is on, so it is never silently active.
 
 ## Non-Goals
 
 - Per-window private state (Safari/Chrome-style private windows).
 - A "Clear All History" action (deferred to a separate spec).
-- A menu bar toggle, toolbar button, or in-window indicator beyond the sidebar header.
-- Encryption, secure deletion, or any privacy guarantees beyond "do not write to `UserDefaults`".
+- A menu bar toggle, toolbar button, or in-window indicator beyond the sidebar header and window title suffix.
+- Encryption, secure deletion, or any privacy guarantees beyond suspending automatic history recording.
 
 ## Behavior Summary
 
 When Private Mode is **ON**:
 - Files opened during the session appear in the sidebar normally, but are **not persisted to disk**.
-- The persistent history on disk is left untouched. Quitting and relaunching restores the sidebar to exactly the state it was in before private mode was first toggled on, plus any non-private opens that happened between.
+- Opening files leaves persistent history untouched. Explicit "Remove from History" actions still update saved history. Relaunching restores that saved history, including removals and any non-private opens that happened between.
 - The sidebar header reads `History (private mode)`.
 - "Remove from History" still works on persisted entries.
 
-When Private Mode is **OFF**: behavior is identical to today.
+When Private Mode is **OFF**: opens are recorded normally. Temporary entries remain visible until quit, but reopening one normally replaces its temporary entry with a newly timestamped persistent entry.
 
 **Opening a file already in persisted history while private mode is on:** the file appears at the top of the sidebar with a "just opened" feel, but on disk its `lastOpenedAt` and ordering are unchanged. After quit and relaunch, the file appears exactly where it was before.
 
@@ -64,10 +64,11 @@ var isPrivateMode: Bool                                            // set extern
 ```swift
 var displayEntries: [RecentFileEntry] {
     let ephemeralPaths = Set(ephemeralEntries.map(\.path))
-    return ephemeralEntries + entries.filter { !ephemeralPaths.contains($0.path) }
+    return (ephemeralEntries + entries.filter { !ephemeralPaths.contains($0.path) })
+        .sorted { $0.lastOpenedAt > $1.lastOpenedAt }
 }
 ```
-Dedupes by `path`: an ephemeral open of a file that is also in persisted history shows once, at the top, with the ephemeral timestamp.
+Dedupes by `path` and sorts the combined list by opening time. An ephemeral open of a persisted file uses its temporary timestamp; a newer normal open is not hidden below older temporary entries.
 
 **`RecentFileEntry` is unchanged.** No new fields, no `Codable` changes, no on-disk format change, no migration.
 
@@ -87,6 +88,7 @@ func add(url: URL) {
         return
     }
 
+    ephemeralEntries.removeAll { $0.path == key }
     entries.removeAll { $0.path == key }
     entries.insert(entry, at: 0)
     if entries.count > maxEntries {
@@ -96,9 +98,9 @@ func add(url: URL) {
 }
 ```
 
-`add(urls:)` mirrors this branching: ephemeral path when `isPrivateMode`, persistent path otherwise. The `maxEntries` cap is applied independently to each list, so a flood of opens during private mode cannot evict persistent history.
+`add(urls:)` mirrors this branching: ephemeral path when `isPrivateMode`, persistent path otherwise. Normal batch opens remove matching temporary entries before adding the persistent entries. The `maxEntries` cap is applied independently to each list, so a flood of opens during private mode cannot evict persistent history.
 
-`remove(path:)` removes from **both** lists. `persist()` is called only if `entries` actually changed.
+`remove(path:)` removes from **both** lists. `persist()` is called only if `entries` actually changed. This explicit user action is the exception to suspending history writes, including when a temporary entry shadows a saved entry.
 
 **Toggling private mode does not mutate either list.** Flipping OFF mid-session leaves existing ephemeral entries visible until quit; subsequent opens go through the persistent path. Flipping back ON keeps persisted history visible while new opens become ephemeral.
 
@@ -106,7 +108,7 @@ func add(url: URL) {
 
 Each `WorkspaceView` is a `@StateObject WorkspaceViewModel`, and each view model constructs its own `RecentFilesStore`. Multiple open windows therefore have independent `RecentFilesStore` instances reading the same shared `UserDefaults` (matches today's architecture). All windows do, however, share a single `AppSettings` instance owned by `ClearanceApp`.
 
-> **Pre-existing limitation, out of scope here:** because each window's `RecentFilesStore` keeps an independent in-memory `entries` array and writes the entire array on every change without reloading from disk, multi-window use today can race — a write from window B can clobber an unobserved write from window A. This bug exists on `main` and is not introduced by private mode (during private mode `entries` is never mutated, so the racy surface area actually shrinks). Fixing it should be a separate spec — most likely "centralize `RecentFilesStore` as a single shared instance" — and is intentionally not bundled into this change.
+> **Pre-existing limitation, out of scope here:** because each window's `RecentFilesStore` keeps an independent in-memory `entries` array and writes the entire array on every change without reloading from disk, multi-window use today can race — a write from window B can clobber an unobserved write from window A. This bug exists on `main` and is not introduced by private mode (private opens do not mutate `entries`, though explicit removals still do). Fixing it should be a separate spec — most likely "centralize `RecentFilesStore` as a single shared instance" — and is intentionally not bundled into this change.
 
 In `WorkspaceViewModel.init`, subscribe to `appSettings.$isPrivateMode` with a Combine sink that assigns the value into `recentFilesStore.isPrivateMode` (and seed it once at init for the initial value). Every window's view model performs this wiring against the shared `AppSettings`, so toggling the setting updates every window's store. No protocol abstraction, no DI changes.
 
@@ -126,7 +128,7 @@ The caption uses `.font(.caption)` and `.foregroundStyle(.secondary)`, matching 
 
 **`RecentFilesSidebar`** takes a new `isPrivateMode: Bool` parameter. Its header label switches between `History` and `History (private mode)`. The `(private mode)` suffix uses `.foregroundStyle(.secondary)` so it reads as an annotation, not a badge. No other sidebar changes — context menus, drag-and-drop, selection, time bucketing all unchanged.
 
-**Window title indicator.** Because the setting persists across launches, the user could otherwise relaunch and forget that recording is suspended. Each `WorkspaceView` adjusts its window title to read `Clearance (private mode)` when `isPrivateMode` is on, and `Clearance` (or whatever the active document title is, per existing behavior) when off. This is implemented by setting the `.navigationTitle(...)` / window title binding on `WorkspaceView` and applies uniformly to every window — including pop-outs — because they share `AppSettings`. The combination of sidebar-header annotation + window title suffix is the only in-window UI; no toolbar, no menu bar, no badge.
+**Window title indicator.** Because the setting persists across launches, the user could otherwise relaunch and forget that recording is suspended. Each `WorkspaceView` appends ` (private mode)` to its existing window title when `isPrivateMode` is on, preserving the active document name and dirty indicator. An empty workspace reads `Clearance (private mode)`. When off, the existing title is unchanged. This is implemented by setting the `.navigationTitle(...)` / window title binding on `WorkspaceView` and applies uniformly to every window — including pop-outs — because they share `AppSettings`. The combination of sidebar-header annotation + window title suffix is the only in-window UI; no toolbar, no menu bar, no badge.
 
 **`WorkspaceView`** passes `viewModel.appSettings.isPrivateMode` into the sidebar and passes `viewModel.recentFilesStore.displayEntries` (instead of `.entries`) as the entries source.
 
@@ -168,9 +170,9 @@ SettingsView toggle → AppSettings.isPrivateMode setter
 - **Private mode + folder import:** all imported files are ephemeral; none persist.
 - **Private mode + popout window:** the new window's `WorkspaceViewModel` subscribes to the same shared `AppSettings`, so it inherits the current value of `isPrivateMode` and tracks subsequent changes. Each window has its own `ephemeralEntries`, so a private open in window A is not visible in window B's sidebar — consistent with how the persisted list already behaves across windows in memory today.
 - **`maxEntries` cap:** applied independently to `entries` and `ephemeralEntries`. Worst case: the user has 200 persistent entries plus up to 200 ephemeral entries during a private session.
-- **`remove(path:)` on an ephemeral entry:** drops it from `ephemeralEntries`. No disk activity needed but the in-memory removal is performed unconditionally so the API stays uniform.
+- **`remove(path:)` on an ephemeral entry:** removes it from both lists. An ephemeral-only entry requires no disk write; an entry shadowing saved history also removes that saved entry.
 - **Legacy migration:** `LegacyDefaultsMigration` is unaffected — it migrates `recentFiles` between bundle IDs. The new `privateMode` key has no legacy equivalent and defaults to `false` for migrated users.
-- **Defaults absent / corrupted:** absence of `"privateMode"` key yields `false` (today's behavior). A non-Bool value at the key falls through to `false` via the standard `bool(forKey:)` semantics.
+- **Defaults absent:** absence of `"privateMode"` yields `false` (today's behavior).
 - **App launches with private mode on:** the user sees the persisted history they had before, with the `(private mode)` header. Any opens during this session remain ephemeral.
 
 ## Testing
@@ -182,9 +184,11 @@ SettingsView toggle → AppSettings.isPrivateMode setter
 3. **Ephemeral dedup with persisted entry** — seed `entries` with file Y, set private mode on, `add(Y)`. Assert `displayEntries` contains Y once at the top with the new timestamp, while `entries` still has Y at its original position with its original timestamp.
 4. **Toggling private off mid-session preserves ephemeral entries** — add a private entry, flip `isPrivateMode = false`, assert `displayEntries` still includes it; then add a new (non-private) entry and assert `persist` writes only the non-ephemeral data.
 5. **Toggling private on mid-session does not modify persisted entries** — seed entries, flip on, assert nothing changes on disk.
-6. **`remove(path:)` works on ephemeral entries** — assert removal updates `displayEntries`; no disk write required.
+6. **`remove(path:)` works on ephemeral entries** — assert an ephemeral-only removal updates `displayEntries` without writing disk; removing an entry that shadows saved history also removes the persisted entry.
 7. **`add(urls:)` honors private mode** — batch import goes ephemeral when private mode is on.
 8. **`maxEntries` cap applies to `ephemeralEntries`** — verify the cap is enforced on the ephemeral list independently.
+9. **Normal reopen replaces temporary history** — open Y privately, switch off, then reopen Y normally. Verify one displayed entry with the latest timestamp, persistence of Y, and removal of its temporary entry. Cover batch opens too.
+10. **Combined history follows opening time** — open Y privately, switch off, then open Z normally. Verify Z appears before Y while Y remains temporary.
 
 ### AppSettings Tests
 
@@ -206,4 +210,4 @@ Round-trip `isPrivateMode` through `UserDefaults`. Verify default is `false` whe
 - **Clear All History** — useful and complementary, but a separate concern. Today the only way to remove entries is one at a time via the sidebar context menu.
 - **Per-window private mode** — explicitly rejected in favor of the simpler app-wide model.
 - **Menu bar toggle / toolbar button** — only the Settings pane surfaces the toggle.
-- **Stronger privacy guarantees** — this feature prevents `UserDefaults` writes; it does not encrypt, secure-erase, or otherwise harden the existing data.
+- **Stronger privacy guarantees** — this feature suspends automatic history recording; it does not encrypt, secure-erase, or otherwise harden the existing data.
